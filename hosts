@@ -1,0 +1,32 @@
+# image: cli-tool   # specify your Docker image here
+# pipelines:  
+#   default:
+#     - step:
+#         script:
+#            - mkdir -p ~/.ssh
+#            - cat my_known_hosts >> ~/.ssh/known_hosts
+#            - (umask  077 ; echo $ANSIBLE_SSH_KEY | base64 --decode > ~/.ssh/k8s_key)
+
+
+
+[kmaster]
+10.0.0.1 ansible_ssh_private_key_file=~/.ssh/k8s_key
+
+[kworker]
+10.0.0.2 ansible_ssh_private_key_file=~/.ssh/k8s_key
+10.0.0.3 ansible_ssh_private_key_file=~/.ssh/k8s_key
+10.0.0.4 ansible_ssh_private_key_file=~/.ssh/k8s_key
+
+[kmaster:vars]
+ansible_user=$HOST_LOGIN
+ansible_ssh_common_args='-o StrictHostKeyChecking=no'
+#ansible_password=$HOST_PASSWORD
+
+ansible_become_password=$HOST_PASSWORD
+
+[kworker:vars]
+ansible_user=$HOST_LOGIN
+ansible_ssh_common_args='-o StrictHostKeyChecking=no'
+#ansible_password=$HOST_PASSWORD
+
+ansible_become_password=$HOST_PASSWORD

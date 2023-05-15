@@ -1,0 +1,189 @@
+---
+
+## Install K8S on Ubuntu 20.04.6 LTS
+
+## CHECK: ansible -i ./hosts -m ping all
+## RUN: ANSIBLE_STDOUT_CALLBACK=yaml ansible-playbook -i ./hosts ./playbook.yaml -v
+##  ssh -o "StrictHostKeyChecking no" cloud_user@ip
+##  scp -r ubuntu@ip:~/.kube/config  ~/.kube/
+
+- name: Update ubuntu servers
+  hosts: kworker:kmaster
+  become: yes
+  tasks:
+    - name: apt update
+      apt:
+        update_cache: yes
+        upgrade: yes
+        state: latest
+
+- name: Load container.d modules
+  hosts: kmaster:kworker
+  gather_facts: no
+  become: yes
+  tasks:
+    - name: Create config file for kernel modules (/etc/modules-load.d/containerd.conf)
+      shell: |
+        cat <<EOF | sudo tee /etc/modules-load.d/containerd.conf
+        overlay
+        br_netfilter
+        EOF
+    - name: Load modules (overlay)
+      ansible.builtin.command: sudo modprobe overlay
+    - name: Load modules (br_netfilter)
+      ansible.builtin.command: sudo modprobe br_netfilter
+
+- name: Configure K8S networking
+  hosts: kmaster:kworker
+  gather_facts: no
+  become: yes
+  tasks:
+    - name: Create config file for networking (/etc/sysctl.d/99-kubernetes-cri.conf)
+      shell: |
+        cat <<EOF | sudo tee /etc/sysctl.d/99-kubernetes-cri.conf
+        net.bridge.bridge-nf-call-iptables = 1
+        net.ipv4.ip_forward = 1
+        net.bridge.bridge-nf-call-ip6tables = 1
+        EOF
+    - name: Apply network settings
+      ansible.builtin.command: sudo sysctl --system
+
+- name: Prepare K8S
+  hosts: kmaster:kworker
+  gather_facts: no
+  become: yes
+  tasks:
+    - name: Turn off SWAP
+      ansible.builtin.command: sudo swapoff -a
+    - name: Install packages (apt-transport-https, curl, gnupg)
+      ansible.builtin.apt:
+        update_cache: yes
+        name:
+        - apt-transport-https
+        - curl
+        - gnupg
+    - name:  Install Docker Repo (make dir for keys)
+      ansible.builtin.command: sudo mkdir -m 0755 -p /etc/apt/keyrings
+    - name:  Install Docker Repo (download key)
+      ansible.builtin.command: curl -fsSLo /etc/apt/keyrings/docker.gpg.asc https://download.docker.com/linux/ubuntu/gpg
+    - name:  Install Docker Repo (load key)
+      shell: "cat /etc/apt/keyrings/docker.gpg.asc | sudo gpg --yes --dearmor -o /etc/apt/keyrings/docker.gpg"
+    - name:  Install Docker Repo (set repo)
+      shell: |
+        echo "deb [arch="$(dpkg --print-architecture)" signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+        "$(. /etc/os-release && echo "$VERSION_CODENAME")" stable" | \
+        sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+
+    - name: Install packages (containerd.io)
+      ansible.builtin.apt:
+        update_cache: yes
+        name:
+        - containerd.io
+    - name: Make dir for containerd
+      ansible.builtin.command: sudo mkdir -p /etc/containerd
+    # - name: Create default containerd configuration
+    #   ansible.builtin.command: sudo containerd config default | sudo tee /etc/containerd/config.toml
+    - name:  Restart containerd
+      ansible.builtin.command: sudo systemctl restart containerd
+    - name:  Download and install Repo Key
+      ansible.builtin.apt_key:
+        url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+        state: present    
+    - name: Create config file for networking (/etc/sysctl.d/99-kubernetes-cri.conf)
+      shell: |
+        cat <<EOF | sudo tee /etc/apt/sources.list.d/kubernetes.list
+        deb https://apt.kubernetes.io/ kubernetes-xenial main
+        EOF
+    - name: Install packages (kubelet, kubeadm, kubectl) v.1.24.0-00
+      ansible.builtin.apt:
+        update_cache: yes
+        name:
+        - kubelet=1.24.0-00
+        - kubeadm=1.24.0-00 
+        - kubectl=1.24.0-00
+    - name: Prevent kubelet from being upgraded
+      ansible.builtin.dpkg_selections:
+        name: kubelet
+        selection: hold
+    - name: Prevent kubeadm from being upgraded
+      ansible.builtin.dpkg_selections:
+        name: kubeadm
+        selection: hold
+    - name: Prevent kubectl from being upgraded
+      ansible.builtin.dpkg_selections:
+        name: kubectl
+        selection: hold
+
+- name: Initialize K8S cluster
+  hosts: kmaster
+  gather_facts: no
+  become: yes
+  tasks:
+    - name: TEMP rm /etc/containerd/config.toml
+      ansible.builtin.command: sudo rm /etc/containerd/config.toml
+      ignore_errors: yes
+    - name:  Restart containerd
+      ansible.builtin.command: sudo systemctl restart containerd
+
+    - name: Initialize the Kubernetes cluster
+      ansible.builtin.command: sudo kubeadm init --pod-network-cidr 192.168.0.0/16 --kubernetes-version 1.24.0 --control-plane-endpoint "{{ groups['kmaster'][0] }}:6443"
+
+- name: Setup access to K8S cluster
+  hosts: kmaster
+  gather_facts: no
+  tasks:
+    - name: Set kubectl access (make dir)
+      ansible.builtin.command: mkdir -p $HOME/.kube
+    - name: Set kubectl access (copy config)
+      ansible.builtin.command: sudo cp -f /etc/kubernetes/admin.conf $HOME/.kube/config
+    - name: Set kubectl access (change file permission)
+      shell: "sudo chown $(id -u):$(id -g) $HOME/.kube/config"
+
+    - name: Install plugin
+      ansible.builtin.command: "kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.25.0/manifests/calico.yaml"
+
+
+- name: Make connections string for working nodes
+  hosts: kmaster
+  gather_facts: no
+  become: yes
+  tasks:
+    - name: Get connection string
+      ansible.builtin.command: sudo kubeadm token create --print-join-command
+      register: kubeadm_join_string
+
+    - name: Set kubeadm_join_string variable
+      set_fact:
+        kubeadm_join_string: "{{kubeadm_join_string}}"
+      register: kubeadm_join_string
+    
+    - name: Add variables to dummy host (value storage in memory)
+      add_host:
+        name: "variable_holder_host"
+        kubeadm_join_string:  "{{ kubeadm_join_string }}"
+
+
+- name: Join Working Nodes to K8S cluster
+  hosts: kworker
+  gather_facts: no
+  vars:
+    kubeadm_join_string: "{{ hostvars['variable_holder_host']['kubeadm_join_string'] }}"
+  become: yes
+  tasks:
+    - name: Change the containerd config
+      shell: |
+        cat <<EOF | sudo tee /etc/containerd/config.toml
+        enabled_plugins = ["cri"]
+        EOF
+    - name:  Restart containerd
+      ansible.builtin.command: sudo systemctl restart containerd
+    - name: Join worker nodes to Kubernetes cluster
+      shell: "sudo {{kubeadm_join_string['ansible_facts']['kubeadm_join_string']['stdout']}}"
+
+- name: Setup local kubectl
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Copy a kube config file to localhost (for TEST only)
+      ansible.builtin.command: scp -r ubuntu@{{ groups['kmaster'][0] }}:~/.kube/config  ~/.kube/
